@@ -298,6 +298,15 @@ def test_rejects_envelope_with_trailing_byte(tmp_path):
     assert result.returncode == 3
 
 
+def test_rejects_sequence_tag_without_length_byte(tmp_path):
+    """题面「长度字段取最短形式」：序列标签后连长度字节都缺时按封套不放行处理。"""
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_missing-length", b"\x30")
+    result = _run(envelope, key, revoked, report, journal)
+    assert result.returncode == 3
+    assert result.stderr.strip().startswith("封套不放行: ")
+    assert not report.exists()
+
+
 def test_rejects_digest_block_with_foreign_prefix(tmp_path):
     """题面「后 32 个字节是正文的 SHA-256」：摘要块挂着别的算法的前缀就拒收。"""
     body = _body()
