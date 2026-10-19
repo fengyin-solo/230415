@@ -225,33 +225,65 @@ def _run(envelope, key, revoked, report, journal, stamp=RELEASE_STAMP, model=REL
     env = {name: value for name, value in os.environ.items() if not name.startswith("PYTEST")}
     env["RELEASE_STAMP"] = stamp
     env["RELEASE_MODEL"] = model
-    return subprocess.run(
+    report_before = report.read_bytes() if report.exists() else None
+    journal_before = journal.read_bytes() if journal.exists() else None
+    finished = subprocess.run(
         [sys.executable, str(APP), str(envelope), str(key), str(revoked), str(report), str(journal)],
         capture_output=True,
         text=True,
         timeout=CALL_TIMEOUT_SEC,
         env=env,
     )
+    finished.report_before = report_before
+    finished.journal_before = journal_before
+    return finished
 
 
 def _run_without_environment(envelope, key, revoked, report, journal):
     env = {name: value for name, value in os.environ.items()
            if name not in ("RELEASE_STAMP", "RELEASE_MODEL") and not name.startswith("PYTEST")}
-    return subprocess.run(
+    report_before = report.read_bytes() if report.exists() else None
+    journal_before = journal.read_bytes() if journal.exists() else None
+    finished = subprocess.run(
         [sys.executable, str(APP), str(envelope), str(key), str(revoked), str(report), str(journal)],
         capture_output=True,
         text=True,
         timeout=CALL_TIMEOUT_SEC,
         env=env,
     )
+    finished.report_before = report_before
+    finished.journal_before = journal_before
+    return finished
 
 
 def _prepare(tmp_path, name, payload, key_payload=None, revoked_text=REVOKED_KEYS, revoked_name=None):
-    envelope = _write(tmp_path / (name + ".der"), payload)
-    key = _write(tmp_path / (name + ".pub"), _public_key_bytes() if key_payload is None else key_payload)
-    revoked = tmp_path / ((revoked_name or name) + ".revoked")
+    tag = "case-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    envelope = _write(tmp_path / (tag + ".der"), payload)
+    key = _write(tmp_path / (tag + ".pub"), _public_key_bytes() if key_payload is None else key_payload)
+    revoked = tmp_path / (tag + ".list")
     revoked.write_text(revoked_text, encoding="utf-8")
-    return envelope, key, revoked, tmp_path / (name + ".json"), tmp_path / (name + ".journal")
+    return envelope, key, revoked, tmp_path / (tag + ".json"), tmp_path / (tag + ".journal")
+
+
+def _rejection_kept_report_and_journal(finished, report, journal):
+    if finished.returncode != 3:
+        return False
+    after_report = report.read_bytes() if report.exists() else None
+    if after_report != finished.report_before:
+        return False
+    after_journal = journal.read_bytes() if journal.exists() else None
+    if finished.journal_before is None:
+        if after_journal is None:
+            return True
+        try:
+            record = json.loads(after_journal.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return (
+            list(record) == ["at", "envelope_sha256", "result", "reason"]
+            and record.get("result") == "rejected"
+        )
+    return after_journal is not None and after_journal.startswith(finished.journal_before)
 
 
 def _report(path):
@@ -262,7 +294,7 @@ def test_rejects_length_with_redundant_leading_zero(tmp_path):
     """题面「长度字段取最短形式」：长形式的长度里带冗余前导零就拒收。"""
     envelope, key, revoked, report, journal = _prepare(tmp_path, PADDED_LENGTH, _envelope(_body(), outer=_tlv_padded_length))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_long_form_length_for_short_value(tmp_path):
@@ -271,7 +303,7 @@ def test_rejects_long_form_length_for_short_value(tmp_path):
     parts[6] = _tlv_long_form_length(0x0C, "Talents Instruments".encode("utf-8"))
     envelope, key, revoked, report, journal = _prepare(tmp_path, LONG_FORM, _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_integer_with_redundant_leading_zero(tmp_path):
@@ -280,7 +312,7 @@ def test_rejects_integer_with_redundant_leading_zero(tmp_path):
     parts[0] = _tlv(0x02, b"\x00\x01")
     envelope, key, revoked, report, journal = _prepare(tmp_path, PADDED_INTEGER, _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_bit_string_with_unused_bits(tmp_path):
@@ -288,21 +320,21 @@ def test_rejects_bit_string_with_unused_bits(tmp_path):
     parts = _default_parts()
     envelope, key, revoked, report, journal = _prepare(tmp_path, UNUSED_BITS, _envelope(_body(), signature_unused=1))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_envelope_with_trailing_byte(tmp_path):
     """题面「序列里不要再拖别的东西」：封套末尾多带一个字节就拒收。"""
     envelope, key, revoked, report, journal = _prepare(tmp_path, TRAILING_BYTE, _envelope(_body(), trailing=b"\x00"))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_sequence_tag_without_length_byte(tmp_path):
     """题面「长度字段取最短形式」：序列标签后连长度字节都缺时按封套不放行处理。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_missing-length", b"\x30")
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-01", b"\x30")
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert result.stderr.strip().startswith("封套不放行: ")
     assert not report.exists()
 
@@ -315,7 +347,7 @@ def test_rejects_digest_block_with_foreign_prefix(tmp_path):
     message = b"\x00\x01" + b"\xff" * (KEY_BYTES - len(foreign) - len(digest) - 3) + b"\x00" + foreign + digest
     envelope, key, revoked, report, journal = _prepare(tmp_path, FOREIGN_PREFIX, _envelope(body, signature=_forge(message)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_broken_pkcs1_padding(tmp_path):
@@ -326,7 +358,7 @@ def test_rejects_broken_pkcs1_padding(tmp_path):
     message = b"\x00\x01" + b"\x00" * padding + b"\x00" + SHA256_PREFIX + digest
     envelope, key, revoked, report, journal = _prepare(tmp_path, BROKEN_PADDING, _envelope(body, signature=_forge(message)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_signature_mismatch(tmp_path):
@@ -336,7 +368,7 @@ def test_rejects_signature_mismatch(tmp_path):
     tampered = _body(parts)
     envelope, key, revoked, report, journal = _prepare(tmp_path, STALE_SIGNATURE, _envelope(tampered, signature=_signature_for(_body())))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_envelope_without_sequence_tag(tmp_path):
@@ -344,7 +376,7 @@ def test_rejects_envelope_without_sequence_tag(tmp_path):
     payload = _envelope(_body())
     envelope, key, revoked, report, journal = _prepare(tmp_path, NOT_A_SEQUENCE, b"\x31" + payload[1:])
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_body_with_missing_field(tmp_path):
@@ -353,7 +385,7 @@ def test_rejects_body_with_missing_field(tmp_path):
     del parts[8]
     envelope, key, revoked, report, journal = _prepare(tmp_path, MISSING_FIELD, _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_unsupported_version(tmp_path):
@@ -362,40 +394,40 @@ def test_rejects_unsupported_version(tmp_path):
     parts[0] = _int(2)
     envelope, key, revoked, report, journal = _prepare(tmp_path, OLD_VERSION, _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_broken_public_key_file(tmp_path):
     """题面「最外面一个序列，里面先是算法标识序列」：公钥文件结构不对就拒收。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_broken-key", _envelope(_body()), key_payload=b"\x30\x00")
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-02", _envelope(_body()), key_payload=b"\x30\x00")
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_release_stamp_outside_validity(tmp_path):
     """题面「放行时刻落在 notBefore 与 notAfter 之间」：早于生效时刻就拒收。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_early-stamp", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-03", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal, stamp="20251231000000")
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_envelope_for_another_model(tmp_path):
     """题面「机型代号与 RELEASE_MODEL 相同」：当班机型换成别的型号就拒收。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_other-model", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-04", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal, model="HX-900")
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_missing_release_environment(tmp_path):
     """题面「这两个变量少一个，设备就放行不了」：工位没注入放行条件就拒收。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_no-environment", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-05", _envelope(_body()))
     result = _run_without_environment(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_accepts_release_stamp_on_lower_boundary(tmp_path):
     """题面「两端当天都算在有效期内」：放行时刻正好是生效时刻也放行。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_lower-boundary", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-06", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal, stamp=str(NOT_BEFORE))
     assert result.returncode == 0
     assert report.is_file()
@@ -403,7 +435,7 @@ def test_accepts_release_stamp_on_lower_boundary(tmp_path):
 
 def test_accepts_release_stamp_on_upper_boundary(tmp_path):
     """题面「两端当天都算在有效期内」：放行时刻正好是失效时刻也放行。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_upper-boundary", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-07", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal, stamp=str(NOT_AFTER))
     assert result.returncode == 0
     assert report.is_file()
@@ -413,7 +445,7 @@ def test_reports_features_by_asn1_bit_order(tmp_path):
     """题面「第 0 位是第一个字节的最高位」：位图 0x05 对应 trace 与 calibration。"""
     parts = _default_parts()
     parts[5] = _bits(bytes([0x05]))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_feature-order", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-08", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _report(report)["features"] == ["trace", "calibration"]
@@ -421,7 +453,7 @@ def test_reports_features_by_asn1_bit_order(tmp_path):
 
 def test_reports_key_identifier_in_lowercase_hex(tmp_path):
     """题面「key_id 是那 8 个字节的小写十六进制」：报告的密钥标识全是小写。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_keyid-case", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-09", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _report(report)["key_id"] == KEY_ID.hex()
@@ -432,10 +464,10 @@ def test_rejection_leaves_existing_report_untouched(tmp_path):
     parts = _default_parts()
     parts[1] = _utf8("SN-99999")
     payload = _envelope(_body(parts), signature=_signature_for(_body()))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_stale-report", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-10", payload)
     report.write_bytes(b"OLD-RELEASE-RECORD\n")
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert report.read_bytes() == b"OLD-RELEASE-RECORD\n"
 
 
@@ -449,7 +481,7 @@ def test_accepts_valid_envelope_and_writes_report(tmp_path):
 
 def test_report_keeps_field_order(tmp_path):
     """题面「字段按 serial、device_model、not_before、not_after、features、authority、key_id、sig_alg、remaining_days、extensions 的顺序排」：报告字段顺序固定。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_report-order", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-11", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     document = _report(report)
@@ -475,7 +507,7 @@ def test_reports_empty_feature_list_when_bitmap_empty(tmp_path):
     """题面「features 是已开通的特性名数组」：一个特性都没开通就是空数组。"""
     parts = _default_parts()
     parts[5] = _bits(b"")
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_no-feature", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-12", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _report(report)["features"] == []
@@ -483,7 +515,7 @@ def test_reports_empty_feature_list_when_bitmap_empty(tmp_path):
 
 def test_usage_error_exits_with_two(tmp_path):
     """题面「位置参数个数不对」：少给一个参数时退出码为 2。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_usage", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-13", _envelope(_body()))
     result = subprocess.run(
         [sys.executable, str(APP), str(envelope)],
         capture_output=True,
@@ -516,65 +548,68 @@ def test_shipped_release_envelope_report_matches_expected(tmp_path):
 def test_rejects_revoked_key_identifier(tmp_path):
     """题面「又不在吊销名单里的，都不放行」：名单命中时拒收。"""
     payload = _envelope(_body())
+    revoked_text = REVOKED_KEYS + KEY_ID.hex() + "\n"
     envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_revoked-key", payload, revoked_text=REVOKED_KEYS + KEY_ID.hex() + "\n"
+        tmp_path, "case-14", payload, revoked_text=revoked_text
     )
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_revocation_list_with_duplicate_lines(tmp_path):
     """题面「名单里同一行出现两次，说明这份名单本身已经坏了」：重复行时拒收。"""
     payload = _envelope(_body())
+    revoked_text = "7c21b48f0a5d3e61\n7c21b48f0a5d3e61\n"
     envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_duplicate-list", payload, revoked_text="7c21b48f0a5d3e61\n7c21b48f0a5d3e61\n"
+        tmp_path, "case-15", payload, revoked_text=revoked_text
     )
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_revocation_list_with_malformed_line(tmp_path):
     """题面「每一行都是 16 位小写十六进制」：名单里出现大写行就拒收。"""
     payload = _envelope(_body())
+    revoked_text = "7C21B48F0A5D3E61\n"
     envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_malformed-list", payload, revoked_text="7C21B48F0A5D3E61\n"
+        tmp_path, "case-16", payload, revoked_text=revoked_text
     )
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_missing_revocation_list(tmp_path):
     """题面「名单文件缺了，说明当天的名单没同步下来」：名单缺失时拒收。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_missing-list", payload)
-    missing = tmp_path / "envelope_missing-list-absent.revoked"
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-17", payload)
+    missing = tmp_path / "case-absent.list"
     result = _run(envelope, key, missing, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_bitmap_with_extra_zero_octet(tmp_path):
     """题面「尾部为 0 的位不进编码」：位图多带一个全零字节就拒收。"""
     parts = _default_parts()
     parts[5] = _bits(bytes([FEATURE_BITS, 0x00]))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_extra-octet", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-18", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_bitmap_with_wrong_unused_bits(tmp_path):
     """题面「未用位数按最后一位为 1 的位置算」：未用位数少算就拒收。"""
     parts = _default_parts()
     parts[5] = _bits(bytes([0x0A]))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_wrong-unused", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-19", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_reports_feature_name_from_second_octet(tmp_path):
     """题面「第 8 位起落到第二个字节」：两字节位图里第二个字节的位按位号报出来。"""
     parts = _default_parts()
     parts[5] = _bits(bytes([0x01, 0x08]), unused=3)
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_wide-bitmap", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-20", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _report(report)["features"] == ["calibration", "highspeed"]
@@ -584,14 +619,14 @@ def test_rejects_impossible_calendar_timestamp(tmp_path):
     """题面「14 位十进制的 UTC 时刻」：月份写成 13 的失效时刻拒收。"""
     parts = _default_parts()
     parts[4] = _int(20261332000000)
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_bad-calendar", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-21", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_report_counts_remaining_whole_days(tmp_path):
     """题面「按 UTC 日界算」：放行当天到失效当天的天数写进报告。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_remaining-days", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-22", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _report(report)["remaining_days"] == 214
@@ -600,23 +635,23 @@ def test_report_counts_remaining_whole_days(tmp_path):
 def test_rejects_envelope_with_extra_element(tmp_path):
     """题面「序列里不要再拖别的东西」：签名之后多带一个元素就拒收。"""
     payload = _envelope(_body(), extra=_octets(b"\x01\x02"))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_extra-element", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-23", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_feature_bit_beyond_named_table(tmp_path):
     """题面「位图按命名位表的规矩编码」：位号落到第 19 位的位图拒收。"""
     parts = _default_parts()
     parts[5] = _bits(bytes([0x00, 0x00, 0x10]), unused=4)
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_wide-index", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-24", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_report_counts_zero_remaining_days_on_upper_boundary(tmp_path):
     """题面「remaining_days 是从放行时刻所在那一天到 notAfter 所在那一天的整天数」：失效当天放行记 0 天。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_zero-days", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-25", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal, stamp=str(NOT_AFTER))
     assert result.returncode == 0
     assert _report(report)["remaining_days"] == 0
@@ -626,32 +661,32 @@ def test_rejects_key_identifier_not_matching_public_key(tmp_path):
     """题面「封套里的 keyId 必须与它对上」：密钥标识与公钥指纹不符就拒收。"""
     parts = _default_parts()
     parts[7] = _octets(bytes(8))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_foreign-keyid", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-26", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_unsorted_extension_set(tmp_path):
     """题面「集合里的项要按各自整段编码从小到大排列」且「顺序与编码大小不符的，整批拒收」：逆序就拒收。"""
     parts = _default_parts()
     parts[8] = _extensions(list(reversed(DEFAULT_EXTENSIONS)))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_unsorted-set", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-27", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_duplicate_extension_elements(tmp_path):
     """题面「出现两项编码完全相同」：集合里有两项一模一样就拒收。"""
     parts = _default_parts()
     parts[8] = _extensions([DEFAULT_EXTENSIONS[1], DEFAULT_EXTENSIONS[1]])
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_duplicate-set", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-28", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_reports_extension_ids_in_encoded_order(tmp_path):
     """题面「按集合里的先后顺序排」：报告里的 extId 按集合顺序写出来。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_extension-order", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-29", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _report(report)["extensions"] == [11, 3]
@@ -662,7 +697,7 @@ def test_accepts_pss_envelope_and_reports_scheme(tmp_path):
     parts = _default_parts()
     body = _body(parts)
     payload = _envelope(body, signature=_pss_signature(body), algorithm=_pss_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-valid", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-30", payload)
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _report(report)["sig_alg"] == "rsassa-pss"
@@ -670,7 +705,7 @@ def test_accepts_pss_envelope_and_reports_scheme(tmp_path):
 
 def test_reports_pkcs1_scheme_for_v15_envelope(tmp_path):
     """题面「sig_alg 按封套声明的口径写」：v1.5 口径的报告写 rsa-pkcs1-v1.5。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_scheme-report", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-31", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _report(report)["sig_alg"] == "rsa-pkcs1-v1.5"
@@ -679,26 +714,26 @@ def test_reports_pkcs1_scheme_for_v15_envelope(tmp_path):
 def test_rejects_unknown_signature_algorithm_oid(tmp_path):
     """题面「声明 v1.5 的只能按 v1.5 的结构核」：算法标识既不是 v1.5 也不是 PSS 就拒收。"""
     payload = _envelope(_body(), algorithm=_v15_algorithm(oid=RSA_OID))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_unknown-oid", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-32", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_v15_algorithm_without_null_parameters(tmp_path):
     """题面「写一个 NULL」：v1.5 的算法标识参数不是 NULL 就拒收。"""
     payload = _envelope(_body(), algorithm=_v15_algorithm(params=_seq([_null()])))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_v15-params", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-33", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_parameters_missing_trailer_field(tmp_path):
     """题面「PSS 那一路的四个字段厂商一律写全，不许省成默认值」：省掉 trailerField 就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body), algorithm=_pss_algorithm(omit=(0xA3,)))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-omitted", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-34", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_parameters_out_of_tag_order(tmp_path):
@@ -706,18 +741,18 @@ def test_rejects_pss_parameters_out_of_tag_order(tmp_path):
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body),
                         algorithm=_pss_algorithm(order=(0xA1, 0xA0, 0xA2, 0xA3)))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-order", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-35", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_with_sha1_hash_algorithm(tmp_path):
     """题面「它自己的参数写 NULL」：PSS 的摘要算法写成 SHA-1 就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body), algorithm=_pss_algorithm(hash_oid=SHA1_OID))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-sha1", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-36", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_mask_algorithm_with_sha1_digest(tmp_path):
@@ -725,9 +760,9 @@ def test_rejects_pss_mask_algorithm_with_sha1_digest(tmp_path):
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body),
                         algorithm=_pss_algorithm(mgf_hash_oid=SHA1_OID))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-mgf1-sha1", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-37", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_mask_algorithm_with_null_parameters(tmp_path):
@@ -735,27 +770,27 @@ def test_rejects_pss_mask_algorithm_with_null_parameters(tmp_path):
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body),
                         algorithm=_pss_algorithm(mgf_params=_null()))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-mgf1-null", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-38", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_with_wrong_salt_length_parameter(tmp_path):
     """题面「盐取出来必须正好 32 个字节」：saltLength 写成 20 就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body), algorithm=_pss_algorithm(salt=20))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-salt-param", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-39", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_with_wrong_trailer_field(tmp_path):
     """题面「厂商一律这样写」：trailerField 写成 2 就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body), algorithm=_pss_algorithm(trailer=2))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-trailer-param", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-40", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_salt_length_with_redundant_leading_zero(tmp_path):
@@ -763,27 +798,27 @@ def test_rejects_pss_salt_length_with_redundant_leading_zero(tmp_path):
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body),
                         algorithm=_pss_algorithm(salt_field=_tlv(0x02, b"\x00\x20")))
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-salt-padded", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-41", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_v15_signature_declared_as_pss(tmp_path):
     """题面「口径与签名结构必须对得上」：把 v1.5 的签名声明成 PSS 就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_signature_for(body), algorithm=_pss_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_cross-scheme-a", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-42", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_signature_declared_as_v15(tmp_path):
     """题面「一份封套两种都不像就拒收」：把 PSS 的签名声明成 v1.5 就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body), algorithm=_v15_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_cross-scheme-b", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-43", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_em_with_high_bit_set(tmp_path):
@@ -791,36 +826,36 @@ def test_rejects_pss_em_with_high_bit_set(tmp_path):
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body, clear_top=False),
                         algorithm=_pss_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-high-bit", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-44", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_em_with_wrong_trailer_byte(tmp_path):
     """题面「末尾一个字节固定是」：EM 末尾字节不是 BC 就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body, trailer=0xBD), algorithm=_pss_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-trailer-byte", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-45", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_em_with_short_salt(tmp_path):
     """题面「盐取出来必须正好 32 个字节」：EM 里只有 20 字节盐就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body, salt_length=20), algorithm=_pss_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-short-salt", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-46", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_em_with_wrong_delimiter(tmp_path):
     """题面「掩码反解出来的中间串必须是一串」：定界字节不是 01 就拒收。"""
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body, delimiter=0x02), algorithm=_pss_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-delimiter", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-47", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_em_with_mismatched_hash(tmp_path):
@@ -828,9 +863,9 @@ def test_rejects_pss_em_with_mismatched_hash(tmp_path):
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body, hash_salt=b"\x33" * PSS_SALT_LENGTH),
                         algorithm=_pss_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-hash-mismatch", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-48", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_em_masked_with_sha1(tmp_path):
@@ -838,9 +873,9 @@ def test_rejects_pss_em_masked_with_sha1(tmp_path):
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body, mgf_hash_oid=SHA1_OID),
                         algorithm=_pss_algorithm())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-mask-sha1", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-49", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_pss_signature_with_unused_bits(tmp_path):
@@ -848,9 +883,9 @@ def test_rejects_pss_signature_with_unused_bits(tmp_path):
     body = _body()
     payload = _envelope(body, signature=_pss_signature(body), algorithm=_pss_algorithm(),
                         signature_unused=1)
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_pss-unused-bits", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-50", payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_accepts_shipped_pss_envelope_from_data_dir(tmp_path):
@@ -883,7 +918,7 @@ def _record_for(payload, result, reason=""):
 def test_journal_appends_release_record(tmp_path):
     """题面「就是这一次核验用的那个放行时刻」「是封套文件原始字节的 SHA-256，小写十六进制」：放行时流水写一条。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-release", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-51", payload)
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _journal_records(journal) == [_record_for(payload, "released")]
@@ -892,7 +927,7 @@ def test_journal_appends_release_record(tmp_path):
 def test_journal_line_is_compact_and_ordered(tmp_path):
     """题面「紧凑 JSON，分隔符后面不加空格，行尾换行」：流水那一行按字段顺序紧凑写出。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-compact", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-52", payload)
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     raw = journal.read_text(encoding="utf-8")
@@ -903,9 +938,9 @@ def test_journal_line_is_compact_and_ordered(tmp_path):
 
 def test_journal_records_rejection_reason(tmp_path):
     """题面「不放行时写与工位打印的那一行里冒号后面完全相同的那句话」：拒收时流水与打印一致。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-rejected", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-53", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal, model="HX-900")
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     records = _journal_records(journal)
     assert records[0]["result"] == "rejected"
     assert result.stderr.strip() == "封套不放行: " + records[0]["reason"]
@@ -913,16 +948,16 @@ def test_journal_records_rejection_reason(tmp_path):
 
 def test_journal_created_on_rejection(tmp_path):
     """题面「不管这一次放行还是不放行，都要往流水里记一笔」：拒收时报告不写、流水要建出来。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-rejected-new", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-54", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal, stamp="20251231000000")
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert not report.exists()
     assert _journal_records(journal)[0]["result"] == "rejected"
 
 
 def test_journal_keeps_single_release_record_on_rerun(tmp_path):
     """题面「上位机同一天重发一次同样的封套，第二次不再往流水里添同样的记录」：重跑不追加。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-rerun", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-55", _envelope(_body()))
     first = _run(envelope, key, revoked, report, journal)
     assert first.returncode == 0
     before = journal.read_bytes()
@@ -934,30 +969,33 @@ def test_journal_keeps_single_release_record_on_rerun(tmp_path):
 
 def test_journal_keeps_single_rejection_record_on_rerun(tmp_path):
     """题面「同一份封套、同一个结果，在同一本流水里只记一条」：同样被拒的第二次不再记。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-rerun-rejected", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-56", _envelope(_body()))
     first = _run(envelope, key, revoked, report, journal, model="HX-900")
-    assert first.returncode == 3
+    assert _rejection_kept_report_and_journal(first, report, journal)
     before = journal.read_bytes()
     second = _run(envelope, key, revoked, report, journal, model="HX-900")
-    assert second.returncode == 3
+    assert _rejection_kept_report_and_journal(second, report, journal)
     assert journal.read_bytes() == before
 
 
 def test_journal_records_rejection_then_release(tmp_path):
-    """题面「两次结果不同，两条都要记」：先被拒后来放行，流水里两条都在。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-both", _envelope(_body()))
+    """先被拒、后来放行、再因为封套结构问题被拒，三次结果都要留在流水里。"""
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-57", _envelope(_body()))
     rejected = _run(envelope, key, revoked, report, journal, model="HX-900")
-    assert rejected.returncode == 3
+    assert _rejection_kept_report_and_journal(rejected, report, journal)
     released = _run(envelope, key, revoked, report, journal)
     assert released.returncode == 0
+    expired_envelope = _write(tmp_path / "case-expired.der", _envelope(_body()) + b"\x00")
+    expired = _run(expired_envelope, key, revoked, report, journal)
+    assert _rejection_kept_report_and_journal(expired, report, journal)
     results = [record["result"] for record in _journal_records(journal)]
-    assert results == ["rejected", "released"]
+    assert results == ["rejected", "released", "rejected"]
 
 
 def test_journal_accepts_records_from_the_same_day(tmp_path):
     """题面「一本流水里只能有同一天的记录」：同一天里另一份封套的记录可以继续往后追加。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-same-day", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-58", payload)
     other = _envelope(_body([_int(1), _utf8("SN-88215"), _utf8("VX-300"), _int(NOT_BEFORE), _int(NOT_AFTER),
                              _bits(bytes([FEATURE_BITS])), _utf8("Talents Instruments"), _octets(KEY_ID),
                              _extensions(DEFAULT_EXTENSIONS)]))
@@ -971,37 +1009,37 @@ def test_journal_accepts_records_from_the_same_day(tmp_path):
 def test_journal_rejects_records_from_another_day(tmp_path):
     """题面「里面已经躺着别的日期的记录，说明这本本子拿错了」：拿错本子时拒收且不动它。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-wrong-day", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-59", payload)
     stale = _record_for(payload, "released")
     stale["at"] = "20260101000000"
     journal.write_text(json.dumps(stale, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
     before = journal.read_bytes()
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert journal.read_bytes() == before
     assert not report.exists()
 
 
 def test_journal_rejects_malformed_line(tmp_path):
     """题面「流水里出现不符合上面形状的行（空行也算），同样按拿错本子处理」：坏行时拒收且不动流水。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-malformed", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-60", _envelope(_body()))
     journal.write_text('{"at":"20260601120000"}\n', encoding="utf-8")
     before = journal.read_bytes()
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert journal.read_bytes() == before
 
 
 def test_journal_keeps_earlier_bytes_when_appending(tmp_path):
     """题面「任何情况下都不许改动流水文件里已经写下的字节」：追加时旧字节逐字不变。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-append", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-61", _envelope(_body()))
     first = _run(envelope, key, revoked, report, journal)
     assert first.returncode == 0
     before = journal.read_bytes()
     other_payload = _envelope(_body([_int(1), _utf8("SN-88216"), _utf8("VX-300"), _int(NOT_BEFORE), _int(NOT_AFTER),
                                      _bits(bytes([FEATURE_BITS])), _utf8("Talents Instruments"), _octets(KEY_ID),
                                      _extensions(DEFAULT_EXTENSIONS)]))
-    other, key2, revoked2, report2, _ = _prepare(tmp_path, "envelope_journal-second", other_payload)
+    other, key2, revoked2, report2, _ = _prepare(tmp_path, "case-62", other_payload)
     second = _run(other, key2, revoked2, report2, journal)
     assert second.returncode == 0
     assert journal.read_bytes().startswith(before)
@@ -1010,7 +1048,7 @@ def test_journal_keeps_earlier_bytes_when_appending(tmp_path):
 
 def test_journal_ignored_on_usage_error(tmp_path):
     """题面「只有位置参数个数不对那一次（退出码」「和根本拿不到放行时刻的那一次不必记」：用法错误不建流水。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-usage", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-63", _envelope(_body()))
     result = subprocess.run(
         [sys.executable, str(APP), str(envelope)],
         capture_output=True,
@@ -1023,9 +1061,9 @@ def test_journal_ignored_on_usage_error(tmp_path):
 
 def test_journal_ignored_without_release_stamp(tmp_path):
     """题面「和根本拿不到放行时刻的那一次不必记」：环境变量缺失时不写流水。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-no-stamp", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-64", _envelope(_body()))
     result = _run_without_environment(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert not journal.exists()
 
 def _public_key_with_algorithm(algorithm):
@@ -1037,13 +1075,18 @@ def _run_without_model(envelope, key, revoked, report, journal):
     env = {name: value for name, value in os.environ.items()
            if name != "RELEASE_MODEL" and not name.startswith("PYTEST")}
     env["RELEASE_STAMP"] = RELEASE_STAMP
-    return subprocess.run(
+    report_before = report.read_bytes() if report.exists() else None
+    journal_before = journal.read_bytes() if journal.exists() else None
+    finished = subprocess.run(
         [sys.executable, str(APP), str(envelope), str(key), str(revoked), str(report), str(journal)],
         capture_output=True,
         text=True,
         timeout=CALL_TIMEOUT_SEC,
         env=env,
     )
+    finished.report_before = report_before
+    finished.journal_before = journal_before
+    return finished
 
 
 def test_rejects_public_key_with_foreign_algorithm_oid(tmp_path):
@@ -1051,10 +1094,9 @@ def test_rejects_public_key_with_foreign_algorithm_oid(tmp_path):
     key_payload = _public_key_with_algorithm(_seq([_tlv(0x06, SHA1_OID), _tlv(0x05, b"")]))
     parts = _default_parts()
     parts[7] = _octets(hashlib.sha256(key_payload).digest()[:8])
-    envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_foreign-pubkey-oid", _envelope(_body(parts)), key_payload=key_payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-65", _envelope(_body(parts)), key_payload=key_payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_public_key_with_padded_null_parameter(tmp_path):
@@ -1062,55 +1104,64 @@ def test_rejects_public_key_with_padded_null_parameter(tmp_path):
     key_payload = _public_key_with_algorithm(_seq([_tlv(0x06, RSA_OID), _tlv(0x05, b"\x00")]))
     parts = _default_parts()
     parts[7] = _octets(hashlib.sha256(key_payload).digest()[:8])
-    envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_padded-pubkey-null", _envelope(_body(parts)), key_payload=key_payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-66", _envelope(_body(parts)), key_payload=key_payload)
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_feature_bitmap_with_nonzero_unused_bits(tmp_path):
     """题面「最后一个字节里被声明为未用的那些低位必须都是零」：位图未用低位非零就拒收。"""
     parts = _default_parts()
     parts[5] = _bits(b"\x0b", unused=3)
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_bitmap-unused-bits", _envelope(_body(parts)))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-67", _envelope(_body(parts)))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_journal_with_blank_line(tmp_path):
     """题面「流水里出现不符合上面形状的行（空行也算）」：流水里多一条空行就按拿错本子拒收。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-blank-line", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-68", _envelope(_body()))
     first = _run(envelope, key, revoked, report, journal)
     assert first.returncode == 0
     journal.write_bytes(journal.read_bytes() + b"\n")
     before = journal.read_bytes()
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
+    assert journal.read_bytes() == before
+
+
+def test_rejects_journal_line_with_non_compact_spacing(tmp_path):
+    """流水必须是紧凑 JSON；分隔符后面多空格也算拿错本子。"""
+    payload = _envelope(_body())
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-journal-spaced", payload)
+    journal.write_text(json.dumps(_record_for(payload, "released"), ensure_ascii=False) + "\n", encoding="utf-8")
+    before = journal.read_bytes()
+    result = _run(envelope, key, revoked, report, journal)
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert journal.read_bytes() == before
 
 
 def test_journals_rejection_when_only_release_model_is_missing(tmp_path):
     """题面「只有位置参数个数不对那一次（退出码」「和根本拿不到放行时刻的那一次不必记」：只缺机型的拒收要记账。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_journal-no-model", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-69", _envelope(_body()))
     result = _run_without_model(envelope, key, revoked, report, journal)
     records = _journal_records(journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert records[0]["result"] == "rejected"
     assert result.stderr.strip() == "封套不放行: " + records[0]["reason"]
 
 
 def test_rejection_leaves_no_new_report_for_structure_failure(tmp_path):
     """题面「被拒或参数不对的时候报告不写」：结构类拒收同样不新建报告。"""
-    envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_no-report-structure", _envelope(_body(), outer=_tlv_padded_length))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-70", _envelope(_body(), outer=_tlv_padded_length))
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert not report.exists()
 
 
 def test_report_is_compact_json_with_trailing_newline(tmp_path):
     """题面「紧凑 JSON，分隔符后面不加空格，结尾换一行」：报告按原始字节核格式。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_report-bytes", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-71", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal)
     raw = report.read_bytes()
     assert result.returncode == 0
@@ -1120,28 +1171,25 @@ def test_report_is_compact_json_with_trailing_newline(tmp_path):
 
 def test_rejects_revoked_list_with_blank_line(tmp_path):
     """题面「格式对不上的行也一样」：名单里夹一条空行就按名单坏掉处理。"""
-    envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_revoked-blank", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-72", _envelope(_body()))
     revoked.write_text("7c21b48f0a5d3e61\n\n", encoding="utf-8")
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_revoked_list_line_with_surrounding_space(tmp_path):
     """题面「每一行都是 16 位小写十六进制」：行首尾多出空白就不算合规的一行。"""
-    envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_revoked-space", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-73", _envelope(_body()))
     revoked.write_text(" 7c21b48f0a5d3e61\n", encoding="utf-8")
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
 
 
 def test_rejects_impossible_calendar_release_stamp(tmp_path):
     """题面「`RELEASE_STAMP` 是 14 位十进制的 UTC 时刻」：月份写成 13 的放行时刻按拿不到处理。"""
-    envelope, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_bad-release-stamp", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-74", _envelope(_body()))
     result = _run(envelope, key, revoked, report, journal, stamp="20261301120000")
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert not report.exists()
 
 
@@ -1165,7 +1213,7 @@ def _envelope_with(serial, not_before=NOT_BEFORE, not_after=NOT_AFTER):
 def test_summary_is_posted_next_to_the_journal(tmp_path):
     """题面「小结贴在流水本子旁边：流水文件的路径后面再接 `.summary` 就是小结的路径」：小结与流水同名同目录。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-post", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-75", payload)
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     assert _summary_path(journal).is_file()
@@ -1174,7 +1222,7 @@ def test_summary_is_posted_next_to_the_journal(tmp_path):
 def test_summary_line_is_compact_and_ordered(tmp_path):
     """题面「小结是一份紧凑 JSON，分隔符后面不加空格，结尾换行」：小结按紧凑格式写出。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-compact", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-76", payload)
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     raw = _summary_path(journal).read_text(encoding="utf-8")
@@ -1186,7 +1234,7 @@ def test_summary_line_is_compact_and_ordered(tmp_path):
 def test_summary_fields_follow_contract_order(tmp_path):
     """题面「字段按 `day`、`released`、`rejected`、`reasons` 的顺序排」：小结的字段顺序固定。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-order", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-77", payload)
     result = _run(envelope, key, revoked, report, journal)
     assert result.returncode == 0
     raw = _summary_path(journal).read_text(encoding="utf-8")
@@ -1196,7 +1244,7 @@ def test_summary_fields_follow_contract_order(tmp_path):
 def test_summary_day_comes_from_journal_record(tmp_path):
     """题面「`day` 是这本流水的日期，取流水里记录的 `at` 的前 8 位」：换个放行时刻，day 跟着流水走。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-day", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-78", payload)
     result = _run(envelope, key, revoked, report, journal, stamp="20260610100000")
     assert result.returncode == 0
     assert _posted_summary(journal)["day"] == "20260610"
@@ -1205,7 +1253,7 @@ def test_summary_day_comes_from_journal_record(tmp_path):
 def test_summary_matches_empty_journal_projection(tmp_path):
     """题面「流水一条记录也没有时写空字符串」：空流水算出的小结就是空日期那一份。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-empty", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-79", payload)
     journal.write_text("", encoding="utf-8")
     _summary_path(journal).write_text('{"day":"","released":0,"rejected":0,"reasons":{}}\n', encoding="utf-8")
     result = _run(envelope, key, revoked, report, journal)
@@ -1216,9 +1264,9 @@ def test_summary_matches_empty_journal_projection(tmp_path):
 def test_summary_counts_net_release_after_rejection(tmp_path):
     """题面「同一份封套按它最后一次的结果算一台，先被拒、后来改好又放行的那一份只算放行」：净台数只算最后一次。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-net", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-80", payload)
     rejected = _run(envelope, key, revoked, report, journal, model="HX-900")
-    assert rejected.returncode == 3
+    assert _rejection_kept_report_and_journal(rejected, report, journal)
     released = _run(envelope, key, revoked, report, journal)
     assert released.returncode == 0
     posted = _posted_summary(journal)
@@ -1229,9 +1277,9 @@ def test_summary_counts_net_release_after_rejection(tmp_path):
 def test_summary_removes_reason_that_netted_to_zero(tmp_path):
     """题面「净剩为零的原因不写进来」：被翻案的那次拒收不再挂在原因台账上。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-zero", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-81", payload)
     rejected = _run(envelope, key, revoked, report, journal, model="HX-900")
-    assert rejected.returncode == 3
+    assert _rejection_kept_report_and_journal(rejected, report, journal)
     released = _run(envelope, key, revoked, report, journal)
     assert released.returncode == 0
     assert _posted_summary(journal)["reasons"] == {}
@@ -1240,17 +1288,17 @@ def test_summary_removes_reason_that_netted_to_zero(tmp_path):
 def test_summary_reason_tally_counts_repeated_reason(tmp_path):
     """题面「`reasons` 是当班净拒收的原因台账，键是不放行时写进流水的那句原因原文，值是它净剩的台数。」：同一个原因拒收多次要累计。"""
     first_payload = _envelope_with("SN-41001")
-    first, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-tally-a", first_payload)
+    first, key, revoked, report, journal = _prepare(tmp_path, "case-82", first_payload)
     one = _run(first, key, revoked, report, journal, model="HX-900")
-    assert one.returncode == 3
+    assert _rejection_kept_report_and_journal(one, report, journal)
     second_payload = _envelope_with("SN-41002")
-    second, key2, revoked2, report2, _ = _prepare(tmp_path, "envelope_summary-tally-b", second_payload)
+    second, key2, revoked2, report2, _ = _prepare(tmp_path, "case-83", second_payload)
     two = _run(second, key2, revoked2, report2, journal, model="HX-900")
-    assert two.returncode == 3
+    assert _rejection_kept_report_and_journal(two, report, journal)
     third_payload = _envelope_with("SN-41003", NOT_BEFORE, 20250930000000)
-    third, key3, revoked3, report3, _ = _prepare(tmp_path, "envelope_summary-tally-c", third_payload)
+    third, key3, revoked3, report3, _ = _prepare(tmp_path, "case-84", third_payload)
     three = _run(third, key3, revoked3, report3, journal)
-    assert three.returncode == 3
+    assert _rejection_kept_report_and_journal(three, report, journal)
     posted = _posted_summary(journal)
     assert posted["reasons"]["机型与当班型号不符"] == 2
     assert posted["rejected"] == 3
@@ -1259,17 +1307,17 @@ def test_summary_reason_tally_counts_repeated_reason(tmp_path):
 def test_summary_orders_reasons_by_count_descending(tmp_path):
     """题面「键先按台数从多到少排」：拒收台数多的那一类原因排在前面。"""
     first_payload = _envelope_with("SN-41001")
-    first, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-rank-a", first_payload)
+    first, key, revoked, report, journal = _prepare(tmp_path, "case-85", first_payload)
     one = _run(first, key, revoked, report, journal, model="HX-900")
-    assert one.returncode == 3
+    assert _rejection_kept_report_and_journal(one, report, journal)
     second_payload = _envelope_with("SN-41002")
-    second, key2, revoked2, report2, _ = _prepare(tmp_path, "envelope_summary-rank-b", second_payload)
+    second, key2, revoked2, report2, _ = _prepare(tmp_path, "case-86", second_payload)
     two = _run(second, key2, revoked2, report2, journal, model="HX-900")
-    assert two.returncode == 3
+    assert _rejection_kept_report_and_journal(two, report, journal)
     third_payload = _envelope_with("SN-41003", NOT_BEFORE, 20250930000000)
-    third, key3, revoked3, report3, _ = _prepare(tmp_path, "envelope_summary-rank-c", third_payload)
+    third, key3, revoked3, report3, _ = _prepare(tmp_path, "case-87", third_payload)
     three = _run(third, key3, revoked3, report3, journal)
-    assert three.returncode == 3
+    assert _rejection_kept_report_and_journal(three, report, journal)
     posted = _posted_summary(journal)
     assert list(posted["reasons"]) == ["机型与当班型号不符", "封套不在有效期内"]
 
@@ -1277,22 +1325,23 @@ def test_summary_orders_reasons_by_count_descending(tmp_path):
 def test_summary_orders_equal_counts_by_reason_bytes(tmp_path):
     """题面「台数相同的按原因的 UTF-8 字节串从小到大排」：同样一票的原因按字节序改名次。"""
     revoked_payload = _envelope_with("SN-42001")
+    revoked_text = REVOKED_KEYS + KEY_ID.hex() + "\n"
     revoked_env, key, revoked, report, journal = _prepare(
-        tmp_path, "envelope_summary-tie-a", revoked_payload, revoked_text=REVOKED_KEYS + KEY_ID.hex() + "\n"
+        tmp_path, "case-88", revoked_payload, revoked_text=revoked_text
     )
     first = _run(revoked_env, key, revoked, report, journal)
-    assert first.returncode == 3
+    assert _rejection_kept_report_and_journal(first, report, journal)
     expired_payload = _envelope_with("SN-42002", NOT_BEFORE, 20250930000000)
-    expired_env, key2, revoked2, report2, _ = _prepare(tmp_path, "envelope_summary-tie-b", expired_payload)
+    expired_env, key2, revoked2, report2, _ = _prepare(tmp_path, "case-89", expired_payload)
     second = _run(expired_env, key2, revoked2, report2, journal)
-    assert second.returncode == 3
+    assert _rejection_kept_report_and_journal(second, report, journal)
     assert list(_posted_summary(journal)["reasons"]) == ["封套不在有效期内", "签发密钥已在吊销名单里"]
 
 
 def test_summary_is_stable_on_rerun(tmp_path):
     """题面「算出来的内容必须跟小结文件里的字节一模一样」：同一份封套再核一次，小结逐字节不变。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-rerun", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-90", payload)
     first = _run(envelope, key, revoked, report, journal)
     assert first.returncode == 0
     before = _summary_path(journal).read_bytes()
@@ -1304,7 +1353,7 @@ def test_summary_is_stable_on_rerun(tmp_path):
 def test_summary_mismatch_rejects_and_leaves_everything_untouched(tmp_path):
     """题面「对不上，就当小结贴错了，这一次直接不放行，报告不写，流水和小结都不许动」：小结被改过就停线。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-stale", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-91", payload)
     first = _run(envelope, key, revoked, report, journal)
     assert first.returncode == 0
     journal_before = journal.read_bytes()
@@ -1312,7 +1361,7 @@ def test_summary_mismatch_rejects_and_leaves_everything_untouched(tmp_path):
     _summary_path(journal).write_text('{"day":"20260601","released":7,"rejected":0,"reasons":{}}\n', encoding="utf-8")
     summary_before = _summary_path(journal).read_bytes()
     second = _run(envelope, key, revoked, report, journal)
-    assert second.returncode == 3
+    assert _rejection_kept_report_and_journal(second, report, journal)
     assert journal.read_bytes() == journal_before
     assert _summary_path(journal).read_bytes() == summary_before
     assert not report.exists()
@@ -1321,20 +1370,20 @@ def test_summary_mismatch_rejects_and_leaves_everything_untouched(tmp_path):
 def test_summary_with_same_meaning_but_other_bytes_rejects(tmp_path):
     """题面「算出来的内容必须跟小结文件里的字节一模一样」：意思一样但字节不同也算贴错。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-bytes", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-92", payload)
     first = _run(envelope, key, revoked, report, journal)
     assert first.returncode == 0
     spaced = '{"day": "20260601", "released": 1, "rejected": 0, "reasons": {}}\n'
     _summary_path(journal).write_text(spaced, encoding="utf-8")
     second = _run(envelope, key, revoked, report, journal)
-    assert second.returncode == 3
+    assert _rejection_kept_report_and_journal(second, report, journal)
     assert _summary_path(journal).read_text(encoding="utf-8") == spaced
 
 
 def test_summary_missing_is_treated_as_unposted(tmp_path):
     """题面「小结文件不在就按没贴处理，本次核验完了再把它贴上去」：没贴小结时照常核验并补上。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-missing", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-93", payload)
     seeded = _envelope_with("SN-43001")
     journal.write_text(json.dumps(_record_for(seeded, "released"), ensure_ascii=False, separators=(",", ":")) + "\n",
                        encoding="utf-8")
@@ -1345,7 +1394,7 @@ def test_summary_missing_is_treated_as_unposted(tmp_path):
 
 def test_summary_ignored_on_usage_error(tmp_path):
     """题面「退出码 `2` 的那一次和拿不到放行时刻的那一次不贴」：参数个数不对时不贴小结。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-usage", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-94", _envelope(_body()))
     result = subprocess.run(
         [sys.executable, str(APP), str(envelope)],
         capture_output=True,
@@ -1358,19 +1407,19 @@ def test_summary_ignored_on_usage_error(tmp_path):
 
 def test_summary_ignored_without_release_stamp(tmp_path):
     """题面「拿不到放行时刻的那一次不贴」：环境变量缺失时不贴小结。"""
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-no-stamp", _envelope(_body()))
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-95", _envelope(_body()))
     result = _run_without_environment(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert not _summary_path(journal).exists()
 
 
 def test_summary_untouched_when_journal_has_another_day(tmp_path):
     """题面「这一次因为流水本子本身有问题而没记账的，小结也不动」：拿错本子时不贴小结。"""
     payload = _envelope(_body())
-    envelope, key, revoked, report, journal = _prepare(tmp_path, "envelope_summary-wrong-day", payload)
+    envelope, key, revoked, report, journal = _prepare(tmp_path, "case-96", payload)
     stale = _record_for(payload, "released")
     stale["at"] = "20260101000000"
     journal.write_text(json.dumps(stale, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
     result = _run(envelope, key, revoked, report, journal)
-    assert result.returncode == 3
+    assert _rejection_kept_report_and_journal(result, report, journal)
     assert not _summary_path(journal).exists()

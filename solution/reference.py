@@ -393,21 +393,26 @@ def verify_pss_signature(body, signature, modulus, exponent):
 
 def load_journal(path):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
+        with open(path, "rb") as handle:
+            raw = handle.read()
     except FileNotFoundError:
         return []
     except OSError as exc:
         raise EnvelopeError("流水本子拿不到: %s" % exc) from exc
+    if raw and not raw.endswith(b"\n"):
+        raise EnvelopeError("流水里有不合规的行")
     records = []
-    for line in text.splitlines():
-        entry = line.strip()
-        if not entry:
+    for physical in raw.splitlines(keepends=True):
+        line = physical[:-1]
+        if not line:
             raise EnvelopeError("流水里有不合规的行")
         try:
-            document = json.loads(entry)
-        except json.JSONDecodeError as exc:
+            text = line.decode("utf-8")
+            document = json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise EnvelopeError("流水里有不合规的行") from exc
+        if json.dumps(document, ensure_ascii=False, separators=(",", ":")) != text:
+            raise EnvelopeError("流水里有不合规的行")
         if not isinstance(document, dict) or list(document) != ["at", "envelope_sha256", "result", "reason"]:
             raise EnvelopeError("流水里有不合规的行")
         moment_text = document["at"]
