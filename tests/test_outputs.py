@@ -546,7 +546,7 @@ def test_shipped_release_envelope_report_matches_expected(tmp_path):
 
 
 def test_rejects_revoked_key_identifier(tmp_path):
-    """题面「又不在吊销名单里的，都不放行」：名单命中时拒收。"""
+    """题面「签发密钥标识必须等于公钥原始字节的 SHA-256 前 8 个字节，同时不得出现在当天的吊销名单里，这两项分别判断，任一项不满足都不放行」：名单命中时拒收。"""
     payload = _envelope(_body())
     revoked_text = REVOKED_KEYS + KEY_ID.hex() + "\n"
     envelope, key, revoked, report, journal = _prepare(
@@ -979,7 +979,7 @@ def test_journal_keeps_single_rejection_record_on_rerun(tmp_path):
 
 
 def test_journal_records_rejection_then_release(tmp_path):
-    """先被拒、后来放行、再因为封套结构问题被拒，三次结果都要留在流水里。"""
+    """题面「同一份封套先被拒、后来改好又放行，两次结果不同，两条都要记」：拒收、放行和再次拒收都要留在流水里。"""
     envelope, key, revoked, report, journal = _prepare(tmp_path, "case-57", _envelope(_body()))
     rejected = _run(envelope, key, revoked, report, journal, model="HX-900")
     assert _rejection_kept_report_and_journal(rejected, report, journal)
@@ -1131,7 +1131,7 @@ def test_rejects_journal_with_blank_line(tmp_path):
 
 
 def test_rejects_journal_line_with_non_compact_spacing(tmp_path):
-    """流水必须是紧凑 JSON；分隔符后面多空格也算拿错本子。"""
+    """题面「流水一行一条记录，紧凑 JSON，分隔符后面不加空格，行尾换行」：多空格的行按拿错本子拒收。"""
     payload = _envelope(_body())
     envelope, key, revoked, report, journal = _prepare(tmp_path, "case-journal-spaced", payload)
     journal.write_text(json.dumps(_record_for(payload, "released"), ensure_ascii=False) + "\n", encoding="utf-8")
